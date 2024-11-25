@@ -3,7 +3,6 @@ from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn.utils import spectral_norm
 
-
 @ARCH_REGISTRY.register()
 class UNetDiscriminatorSN(nn.Module):
     """Defines a U-Net discriminator with spectral normalization (SN)
@@ -65,3 +64,37 @@ class UNetDiscriminatorSN(nn.Module):
         out = self.conv9(out)
 
         return out
+'''
+class XTransformer(nn.Module):
+    def __init__(self, architecture='Transformer', architecture_args={}):
+        super().__init__()
+        match architecture:
+            case 'Transformer':
+                self.model = TransformerModule(**architecture_args)
+            case _:
+                raise NotImplementedError(f'Architecture {architecture} not implemented')
+
+    def forward(self, x, kv=None, kv_mask=None, mask=None):
+        return self.model(x, kv=kv, kv_mask=kv_mask, mask=mask)
+
+@ARCH_REGISTRY.register()
+class VITDiscriminator(nn.Module):
+    def __init__(
+            self,
+            architecture,
+            architecture_args,
+            patch_size=16,
+            in_chans=3,
+            embed_dim=768,
+            ):
+        super().__init__()
+        self.XF=XTransformer(architecture=architecture, architecture_args=architecture_args)
+        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.unpatch_embed = nn.Conv2d(embed_dim, embed_dim, kernel_size=1)
+
+    def forward(self, x):
+        x=self.patch_embed(x).transpose(1,3)
+        x=self.XF(x)
+        x=self.unpatch_embed(x.transpose(1,3))
+        return x
+'''

@@ -10,7 +10,6 @@ from basicsr.utils import FileClient, imfrombytes, img2tensor
 from basicsr.utils.matlab_functions import imresize, rgb2ycbcr
 from basicsr.utils.registry import DATASET_REGISTRY
 
-
 @DATASET_REGISTRY.register()
 class ImageNetPairedDataset(data.Dataset):
     

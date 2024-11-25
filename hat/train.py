@@ -1,4 +1,5 @@
 # flake8: noqa
+import os
 import os.path as osp
 
 import hat.archs

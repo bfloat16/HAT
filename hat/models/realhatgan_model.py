@@ -9,6 +9,7 @@ from basicsr.utils.img_process_util import filter2D
 from basicsr.utils.registry import MODEL_REGISTRY
 from collections import OrderedDict
 from torch.nn import functional as F
+from torch.amp import GradScaler, autocast
 
 
 @MODEL_REGISTRY.register()
@@ -25,6 +26,8 @@ class RealHATGANModel(SRGANModel):
         self.jpeger = DiffJPEG(differentiable=False).cuda()  # simulate JPEG compression artifacts
         self.usm_sharpener = USMSharp().cuda()  # do usm sharpening
         self.queue_size = opt.get('queue_size', 180)
+        self.scaler_g = GradScaler()
+        self.scaler_d = GradScaler()
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self):
@@ -121,20 +124,14 @@ class RealHATGANModel(SRGANModel):
             else:
                 scale = 1
             mode = random.choice(['area', 'bilinear', 'bicubic'])
-            out = F.interpolate(
-                out, size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), mode=mode)
+            out = F.interpolate(out, size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), mode=mode)
             # add noise
             gray_noise_prob = self.opt['gray_noise_prob2']
             if np.random.uniform() < self.opt['gaussian_noise_prob2']:
                 out = random_add_gaussian_noise_pt(
                     out, sigma_range=self.opt['noise_range2'], clip=True, rounds=False, gray_prob=gray_noise_prob)
             else:
-                out = random_add_poisson_noise_pt(
-                    out,
-                    scale_range=self.opt['poisson_scale_range2'],
-                    gray_prob=gray_noise_prob,
-                    clip=True,
-                    rounds=False)
+                out = random_add_poisson_noise_pt(out, scale_range=self.opt['poisson_scale_range2'], gray_prob=gray_noise_prob, clip=True, rounds=False)
 
             # JPEG compression + the final sinc filter
             # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
@@ -167,8 +164,7 @@ class RealHATGANModel(SRGANModel):
 
             # random crop
             gt_size = self.opt['gt_size']
-            (self.gt, self.gt_usm), self.lq = paired_random_crop([self.gt, self.gt_usm], self.lq, gt_size,
-                                                                 self.opt['scale'])
+            (self.gt, self.gt_usm), self.lq = paired_random_crop([self.gt, self.gt_usm], self.lq, gt_size, self.opt['scale'])
 
             # training pair pool
             self._dequeue_and_enqueue()
@@ -200,61 +196,82 @@ class RealHATGANModel(SRGANModel):
         if self.opt['gan_gt_usm'] is False:
             gan_gt = self.gt
 
-        # optimize net_g
-        for p in self.net_d.parameters():
-            p.requires_grad = False
-
-        self.optimizer_g.zero_grad()
-        self.output = self.net_g(self.lq)
-
-        l_g_total = 0
         loss_dict = OrderedDict()
+
+        # -------------------------------
+        # Optimize Generator (net_g)
+        # -------------------------------
         if (current_iter % self.net_d_iters == 0 and current_iter > self.net_d_init_iters):
-            # pixel loss
-            if self.cri_pix:
-                l_g_pix = self.cri_pix(self.output, l1_gt)
-                l_g_total += l_g_pix
-                loss_dict['l_g_pix'] = l_g_pix
-            # perceptual loss
-            if self.cri_perceptual:
-                l_g_percep, l_g_style = self.cri_perceptual(self.output, percep_gt)
-                if l_g_percep is not None:
-                    l_g_total += l_g_percep
-                    loss_dict['l_g_percep'] = l_g_percep
-                if l_g_style is not None:
-                    l_g_total += l_g_style
-                    loss_dict['l_g_style'] = l_g_style
-            # gan loss
-            fake_g_pred = self.net_d(self.output)
-            l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
-            l_g_total += l_g_gan
-            loss_dict['l_g_gan'] = l_g_gan
+            for p in self.net_d.parameters():
+                p.requires_grad = False
 
-            l_g_total.backward()
-            self.optimizer_g.step()
+            self.optimizer_g.zero_grad()
 
-        # optimize net_d
+            with autocast(device_type="cuda"):
+                self.output = self.net_g(self.lq)
+
+                l_g_total = 0
+                # Pixel loss
+                if self.cri_pix:
+                    l_g_pix = self.cri_pix(self.output, l1_gt)
+                    l_g_total += l_g_pix
+                    loss_dict['l_g_pix'] = l_g_pix
+
+                # Perceptual loss
+                if self.cri_perceptual:
+                    l_g_percep, l_g_style = self.cri_perceptual(self.output, percep_gt)
+                    if l_g_percep is not None:
+                        l_g_total += l_g_percep
+                        loss_dict['l_g_percep'] = l_g_percep
+                    if l_g_style is not None:
+                        l_g_total += l_g_style
+                        loss_dict['l_g_style'] = l_g_style
+
+                # GAN loss
+                fake_g_pred = self.net_d(self.output)
+                l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
+                l_g_total += l_g_gan
+                loss_dict['l_g_gan'] = l_g_gan
+
+            # 反向传播和优化
+            self.scaler_g.scale(l_g_total).backward()
+            self.scaler_g.step(self.optimizer_g)
+            self.scaler_g.update()
+
+        # -------------------------------
+        # Optimize Discriminator (net_d)
+        # -------------------------------
         for p in self.net_d.parameters():
             p.requires_grad = True
 
         self.optimizer_d.zero_grad()
-        # real
-        real_d_pred = self.net_d(gan_gt)
-        l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
-        loss_dict['l_d_real'] = l_d_real
-        loss_dict['out_d_real'] = torch.mean(real_d_pred.detach())
-        l_d_real.backward()
-        # fake
-        fake_d_pred = self.net_d(self.output.detach().clone())  # clone for pt1.9
-        l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
-        loss_dict['l_d_fake'] = l_d_fake
-        loss_dict['out_d_fake'] = torch.mean(fake_d_pred.detach())
-        l_d_fake.backward()
-        self.optimizer_d.step()
 
+        with autocast(device_type="cuda"):
+            # Real loss
+            real_d_pred = self.net_d(gan_gt)
+            l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
+            loss_dict['l_d_real'] = l_d_real
+            loss_dict['out_d_real'] = torch.mean(real_d_pred.detach())
+
+            # Fake loss
+            fake_d_pred = self.net_d(self.output.detach())
+            l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
+            loss_dict['l_d_fake'] = l_d_fake
+            loss_dict['out_d_fake'] = torch.mean(fake_d_pred.detach())
+
+            # 总判别器损失
+            l_d_total = l_d_real + l_d_fake
+
+        # 反向传播和优化
+        self.scaler_d.scale(l_d_total).backward()
+        self.scaler_d.step(self.optimizer_d)
+        self.scaler_d.update()
+
+        # 更新 EMA
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
 
+        # 记录损失
         self.log_dict = self.reduce_loss_dict(loss_dict)
     
     def test(self):

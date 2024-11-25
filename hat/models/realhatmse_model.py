@@ -12,14 +12,6 @@ from torch.nn import functional as F
 
 @MODEL_REGISTRY.register()
 class RealHATMSEModel(SRModel):
-    """MSE-based Real_HAT Model.
-
-    It is trained without GAN losses.
-    It mainly performs:
-    1. randomly synthesize LQ images in GPU tensors
-    2. optimize the networks with GAN training.
-    """
-
     def __init__(self, opt):
         super(RealHATMSEModel, self).__init__(opt)
         self.jpeger = DiffJPEG(differentiable=False).cuda()  # simulate JPEG compression artifacts
@@ -65,8 +57,6 @@ class RealHATMSEModel(SRModel):
 
     @torch.no_grad()
     def feed_data(self, data):
-        """Accept data from dataloader, and then add two-order degradations to obtain LQ images.
-        """
         if self.is_train and self.opt.get('high_order_degradation', True):
             # training data synthesis
             self.gt = data['gt'].to(self.device)
@@ -131,12 +121,7 @@ class RealHATMSEModel(SRModel):
                 out = random_add_gaussian_noise_pt(
                     out, sigma_range=self.opt['noise_range2'], clip=True, rounds=False, gray_prob=gray_noise_prob)
             else:
-                out = random_add_poisson_noise_pt(
-                    out,
-                    scale_range=self.opt['poisson_scale_range2'],
-                    gray_prob=gray_noise_prob,
-                    clip=True,
-                    rounds=False)
+                out = random_add_poisson_noise_pt(out, scale_range=self.opt['poisson_scale_range2'], gray_prob=gray_noise_prob, clip=True, rounds=False)
 
             # JPEG compression + the final sinc filter
             # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
